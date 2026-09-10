@@ -1,0 +1,82 @@
+%pip install langchain==0.3.25
+%pip install langchain-openai==0.3.19
+
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model(
+    "gpt-4o-mini",
+    model_provider="openai"
+)
+
+@tool
+def add(a: int, b: int) -> int:
+    return a + b
+
+@tool
+def subtract(a: int, b: int) -> int:
+    return a - b
+
+@tool
+def multiply(a: int, b: int) -> int:
+    return a * b
+
+@tool
+def calculate_tip(total_bill: float, tip_percent: float) -> float:
+    return total_bill * tip_percent * 0.01
+
+tools = [
+    add,
+    subtract,
+    multiply,
+    calculate_tip
+]
+
+tool_map = {
+    "add": add,
+    "subtract": subtract,
+    "multiply": multiply,
+    "calculate_tip": calculate_tip
+}
+
+llm_with_tools = llm.bind_tools(tools)
+
+class ToolCallingAgent:
+    def __init__(self, llm):
+        self.llm_with_tools = llm.bind_tools(tools)
+        self.tool_map = tool_map
+
+    def run(self, query: str) -> str:
+        chat_history = [
+            HumanMessage(content=query)
+        ]
+
+        while True:
+            response = self.llm_with_tools.invoke(chat_history)
+
+            if not response.tool_calls:
+                return response.content
+
+            chat_history.append(response)
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                tool_call_id = tool_call["id"]
+
+                tool_result = self.tool_map[tool_name].invoke(tool_args)
+
+                chat_history.append(
+                    ToolMessage(
+                        content=str(tool_result),
+                        tool_call_id=tool_call_id
+                    )
+                )
+
+agent = ToolCallingAgent(llm)
+
+print(agent.run("What is 25 plus 17?"))
+print(agent.run("What is 100 minus 37?"))
+print(agent.run("What is 12 times 8?"))
+print(agent.run("How much should I tip on $60 at 20%?"))
