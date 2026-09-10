@@ -71,6 +71,7 @@ def retriever_qa(file,query):
     llm=get_llm()
     retriver_obj=retriver(file)
     qa=RetrievalQA.from_chain_type(
+        llm,
         chain_type="stuff",
         retriever_obj=retriver_obj,
         return_source_documents=False
