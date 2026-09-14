@@ -1,0 +1,301 @@
+!pip install -U langgraph langchain-openai
+
+%%capture
+!pip install langgraph==0.3.34 langchain-openai==0.3.14 langchainhub==0.1.21 langchain==0.3.24 pygraphviz==1.14 langchain-community==0.3.23
+
+import warnings
+warnings.filterwarnings('ignore')
+
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain.tools import tool
+import os
+import json
+
+os.environ["TAVILY_API_KEY"] = "YOUR_KEY_HERE"
+
+search = TavilySearchResults()
+
+@tool
+def search_tool(query: str):
+    """
+    Search the web for information using Tavily API.
+
+    :param query: The search query string
+    :return: Search results related to the query
+    """
+    return search.invoke(query)
+
+search_tool.invoke("What's the weather like in Tokyo today?")
+
+
+@tool
+def recommend_clothing(weather: str) -> str:
+    """
+    Returns a clothing recommendation based on the provided weather description.
+
+    This function examines the input string for specific keywords or temperature indicators
+    (e.g., "snow", "freezing", "rain", "85°F") to suggest appropriate attire. It handles
+    common weather conditions like snow, rain, heat, and cold by providing simple and practical
+    clothing advice.
+
+    :param weather: A brief description of the weather (e.g., "Overcast, 64.9°F")
+    :return: A string with clothing recommendations suitable for the weather
+    """
+    weather = weather.lower()
+
+    if "snow" in weather or "freezing" in weather:
+        return "Wear a heavy coat, gloves, and boots."
+    elif "rain" in weather or "wet" in weather:
+        return "Bring a raincoat and waterproof shoes."
+    elif "hot" in weather or "85" in weather:
+        return "T-shirt, shorts, and sunscreen recommended."
+    elif "cold" in weather or "50" in weather:
+        return "Wear a warm jacket or sweater."
+    else:
+        return "A light jacket should be fine."
+
+
+tools = [search_tool, recommend_clothing]
+
+tools_by_name = {tool.name: tool for tool in tools}
+
+
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+
+model = ChatOpenAI(model="gpt-4o-mini")
+
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
+
+chat_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+You are a helpful AI assistant that thinks step-by-step and uses tools when needed.
+
+When responding to queries:
+1. First, think about what information you need
+2. Use available tools if you need current data or specific capabilities
+3. Provide clear, helpful responses based on your reasoning and any tool results
+
+Always explain your thinking process to help users understand your approach.
+"""
+    ),
+    MessagesPlaceholder(variable_name="scratch_pad")
+])
+
+
+model_react = chat_prompt | model.bind_tools(tools)
+
+
+from typing import Annotated, Sequence, TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+state: AgentState = {"messages": []}
+
+state["messages"] = add_messages(
+    state["messages"],
+    [HumanMessage(content="Hi")]
+)
+
+print("After greeting:", state["messages"])
+
+state["messages"] = add_messages(
+    state["messages"],
+    [HumanMessage(content="Weather in NYC?")]
+)
+
+print("After question:", state)
+
+
+dummy_state: AgentState = {
+    "messages": [
+        HumanMessage(
+            "What's the weather like in Zurich, and what should I wear based on the temperature?"
+        )
+    ]
+}
+
+response = model_react.invoke(
+    {"scratch_pad": dummy_state["messages"]}
+)
+
+dummy_state["messages"] = add_messages(
+    dummy_state["messages"],
+    [response]
+)
+
+
+tool_call = response.tool_calls[-1]
+
+print("Tool call:", tool_call)
+
+tool_result = tools_by_name[
+    tool_call["name"]
+].invoke(tool_call["args"])
+
+print("Tool result preview:", tool_result[0]["title"])
+
+tool_message = ToolMessage(
+    content=json.dumps(tool_result),
+    name=tool_call["name"],
+    tool_call_id=tool_call["id"]
+)
+
+dummy_state["messages"] = add_messages(
+    dummy_state["messages"],
+    [tool_message]
+)
+
+
+response = model_react.invoke(
+    {"scratch_pad": dummy_state["messages"]}
+)
+
+dummy_state["messages"] = add_messages(
+    dummy_state["messages"],
+    [response]
+)
+
+if response.tool_calls:
+    tool_call = response.tool_calls[0]
+
+    tool_result = tools_by_name[
+        tool_call["name"]
+    ].invoke(tool_call["args"])
+
+    tool_message = ToolMessage(
+        content=json.dumps(tool_result),
+        name=tool_call["name"],
+        tool_call_id=tool_call["id"]
+    )
+
+    dummy_state["messages"] = add_messages(
+        dummy_state["messages"],
+        [tool_message]
+    )
+
+
+response = model_react.invoke(
+    {"scratch_pad": dummy_state["messages"]}
+)
+
+print(
+    "Final response generated:",
+    response.content is not None
+)
+
+print(
+    "More tools needed:",
+    bool(response.tool_calls)
+)
+
+
+def tool_node(state: AgentState):
+    outputs = []
+
+    for tool_call in state["messages"][-1].tool_calls:
+        tool_result = tools_by_name[
+            tool_call["name"]
+        ].invoke(tool_call["args"])
+
+        outputs.append(
+            ToolMessage(
+                content=json.dumps(tool_result),
+                name=tool_call["name"],
+                tool_call_id=tool_call["id"],
+            )
+        )
+
+    return {"messages": outputs}
+
+
+def call_model(state: AgentState):
+    response = model_react.invoke(
+        {"scratch_pad": state["messages"]}
+    )
+
+    return {"messages": [response]}
+
+
+def should_continue(state: AgentState):
+    messages = state["messages"]
+
+    last_message = messages[-1]
+
+    if not last_message.tool_calls:
+        return "end"
+    else:
+        return "continue"
+
+
+from langgraph.graph import StateGraph, END
+
+workflow = StateGraph(AgentState)
+
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", tool_node)
+
+workflow.add_edge("tools", "agent")
+
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "continue": "tools",
+        "end": END,
+    },
+)
+
+workflow.set_entry_point("agent")
+
+graph = workflow.compile()
+
+
+from IPython.display import Image, display
+
+try:
+    display(
+        Image(
+            graph.get_graph().draw_mermaid_png()
+        )
+    )
+except Exception:
+    pass
+
+
+def print_stream(stream):
+    for s in stream:
+        message = s["messages"][-1]
+
+        if isinstance(message, tuple):
+            print(message)
+        else:
+            message.pretty_print()
+
+
+inputs = {
+    "messages": [
+        HumanMessage(
+            content="What's the weather like in Zurich, and what should I wear based on the temperature?"
+        )
+    ]
+}
+
+print_stream(
+    graph.stream(
+        inputs,
+        stream_mode="values"
+    )
+)
+
+
+
