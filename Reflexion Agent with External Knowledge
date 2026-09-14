@@ -1,0 +1,270 @@
+%pip install langchain-openai==0.3.10
+%pip install langchain==0.3.21
+%pip install openai==1.68.2
+%pip install langchain-community==0.2.1
+%pip install --upgrade langgraph
+%pip install langchain_community==0.3.24
+
+import os
+import json
+import getpass
+from typing import List, Dict
+
+from pydantic import BaseModel, Field
+
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    BaseMessage
+)
+
+from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
+from langchain_community.tools.tavily_search import TavilySearchResults
+
+from langgraph.graph import END, MessageGraph
+
+
+def _set_if_undefined(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"Please enter your {var}: ")
+
+
+_set_if_undefined("TAVILY_API_KEY")
+
+
+search = TavilySearchResults(max_results=5)
+
+search.invoke("What is artificial intelligence?")
+
+
+llm = ChatOpenAI(model="gpt-5-nano")
+
+
+prompt_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an expert researcher and writer.
+Answer the user's question accurately and clearly.
+You should provide detailed and useful information.
+Think carefully about what information may be missing from your answer.
+If more research is required, create search queries to find the missing information."""
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+
+first_responder_prompt = prompt_template.partial(
+    system="""You are an expert researcher and writer.
+Answer the user's question accurately and clearly.
+You should provide detailed and useful information.
+Think carefully about what information may be missing from your answer.
+If more research is required, create search queries to find the missing information."""
+)
+
+
+chain = first_responder_prompt | llm
+
+
+response = chain.invoke(
+    [
+        HumanMessage(
+            content="What is artificial intelligence?"
+        )
+    ]
+)
+
+response
+
+
+class Reflection(BaseModel):
+    missing: str = Field(
+        description="Critique of what is missing from the answer."
+    )
+    superfluous: str = Field(
+        description="Critique of what is unnecessary in the answer."
+    )
+
+
+class AnswerQuestion(BaseModel):
+    answer: str = Field(
+        description="A detailed answer to the user's question."
+    )
+    reflection: Reflection = Field(
+        description="Reflection and critique of the answer."
+    )
+    search_queries: List[str] = Field(
+        description="Search queries needed to improve the answer."
+    )
+
+
+initial_chain = first_responder_prompt | llm.bind_tools(
+    tools=[AnswerQuestion]
+)
+
+
+response = initial_chain.invoke(
+    [
+        HumanMessage(
+            content="What is artificial intelligence?"
+        )
+    ]
+)
+
+response
+
+
+response.tool_calls
+
+
+answer = response.tool_calls[0]["args"]["answer"]
+
+reflection = response.tool_calls[0]["args"]["reflection"]
+
+search_queries = response.tool_calls[0]["args"]["search_queries"]
+
+answer
+
+
+reflection
+
+
+search_queries
+
+
+response_list = [
+    HumanMessage(
+        content="What is artificial intelligence?"
+    ),
+    response
+]
+
+
+def execute_tools(state: List[BaseMessage]):
+    last_ai_message = state[-1]
+
+    tool_messages = []
+
+    for tool_call in last_ai_message.tool_calls:
+        query = tool_call["args"]["search_queries"]
+
+        for search_query in query:
+            result = search.invoke(search_query)
+
+            tool_messages.append(
+                ToolMessage(
+                    content=json.dumps(result),
+                    tool_call_id=tool_call["id"]
+                )
+            )
+
+    return tool_messages
+
+
+revisor_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an expert researcher and writer.
+Review the existing answer using the research results.
+
+Improve the answer by:
+1. Fixing factual errors.
+2. Adding missing information.
+3. Removing unnecessary information.
+4. Making the answer clear and useful.
+5. Using the research results to support the answer.
+
+Return an improved answer."""
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+
+class ReviseAnswer(AnswerQuestion):
+    references: List[str] = Field(
+        description="References used to improve the answer."
+    )
+
+
+revisor_chain = revisor_prompt | llm.bind_tools(
+    tools=[ReviseAnswer]
+)
+
+
+MAX_ITERATIONS = 4
+
+
+def event_loop(state: List[BaseMessage]):
+    count = 0
+
+    for message in state:
+        if isinstance(message, ToolMessage):
+            count += 1
+
+    if count >= MAX_ITERATIONS:
+        return END
+
+    return "execute_tools"
+
+
+from langgraph.graph import MessageGraph
+
+
+graph = MessageGraph()
+
+graph.add_node(
+    "respond",
+    initial_chain
+)
+
+graph.add_node(
+    "execute_tools",
+    execute_tools
+)
+
+graph.add_node(
+    "revisor",
+    revisor_chain
+)
+
+graph.add_edge(
+    "respond",
+    "execute_tools"
+)
+
+graph.add_edge(
+    "execute_tools",
+    "revisor"
+)
+
+graph.add_conditional_edges(
+    "revisor",
+    event_loop
+)
+
+graph.set_entry_point("respond")
+
+
+app = graph.compile()
+
+
+responses = app.invoke(
+    [
+        HumanMessage(
+            content="""I'm pre-diabetic and need to lower my blood sugar,
+and I have heart issues. What breakfast foods should I eat and avoid"""
+        )
+    ]
+)
+
+
+for message in responses:
+    print("\n")
+    print(type(message).__name__)
+    print(message.content)
